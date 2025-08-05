@@ -74,81 +74,63 @@ def extract_text_from_pdf(pdf_stream, page_number=0):
     return {"text": text, "image": image, "error": None}
 
 
-def extract_table_with_gemini(data, model_name="gemini-1.5-flash-latest"):
+def extract_table_with_gemini(data, model_name="gemini-1.5-flash-latest", large_table_mode=False):
     """
     Uses a selected Gemini model to extract a table from text or an image.
     """
-    prompt_template = """
+    if large_table_mode:
+        prompt_template = """
 You are a specialized document parser. Extract ALL tables from this page with complete accuracy.
 
-## Core Requirements
+## LARGE TABLE MODE - Optimized for 50+ rows
+
+### Core Requirements
+- **EXTRACT EVERYTHING**: Every row, every column - COMPLETENESS is critical
+- **PRESERVE NUMBERS**: Keep exact formatting but remove commas if needed to save space
+- **ABBREVIATE HEADERS**: Use short, clear column names
+
+### Space-Optimized Rules
+- Remove unnecessary spaces and line breaks from data
+- Abbreviate long column headers: "Agriculture,Forestry andFishing" → "Agriculture"
+- Keep numbers exact but remove thousand separators if space-critical
+- Use "-" for empty cells consistently
+
+### Output Format - COMPACT
+```json
+{
+    "table_data": [
+        ["No", "Bank", "Total", "Agriculture", "Mining", "Manufacturing", "Utilities", "Construction", "Wholesale", "Retail", "Accommodation", "Arts", "Transport", "Information", "RealEstate1", "RealEstate2", "Education", "Health", "Households", "Other"],
+        ["1", "ACLEDA Bank", "27934459", "5722614", "201477", "740254", "94281", "1446649", "1785014", "7502966", "1699046", "55445", "1269974", "11621", "171547", "1065967", "60991", "293008", "4145764", "1667641"],
+        ["2", "ARD Bank", "34261391", "1940701", "132366", "2232257", "451656", "1215570", "5457157", "9833936", "1377304", "121509", "936859", "39712", "570429", "6648074", "-", "-", "162242", "3111614"]
+    ],
+    "rows": 52
+}
+```
+
+Extract ALL rows. Priority: COMPLETENESS over formatting details.
+"""
+    else:
+        prompt_template = """
+You are a specialized document parser. Extract ALL tables from this page with complete accuracy.
+
+## Standard Mode Requirements
 - **EXTRACT EVERYTHING**: Every table, every row, every column, every cell
 - **PRESERVE EXACTLY**: All numbers, formatting, punctuation, and text as shown
 - **NO INTERPRETATION**: Extract exactly what you see, don't convert or standardize
 
-## Critical Rules
-
-### 1. Complete Extraction
-- Scan entire page systematically (left-to-right, top-to-bottom)
-- Extract tables regardless of orientation (portrait/landscape)
-- Include ALL rows: headers, data, subtotals, totals, footnotes within table structure
-- Count and verify: output row count MUST match source
-
-### 2. Value Preservation
-- **Numbers**: Keep exact formatting: "1,361,196", "(2,207)", "2.5%", "-"
-- **Text**: Preserve case, spacing, special characters
-- **Empty cells**: Use empty string "" (not null, "0", or "-" unless actually shown)
-- **Merged cells**: Repeat the value for all positions it spans
-
-### 3. Header Processing
-- **Detection**: First row with text/labels = headers
-- **Cleaning**: Trim whitespace, preserve original language and case
-- **Duplicates**: Append "_2", "_3" etc: "Amount", "Amount_2", "Amount_3"
-- **Missing**: Generate "Column_1", "Column_2" if no clear headers
-
-### 4. Complex Structure Handling
-- **Multi-level headers**: Combine with underscore: "2024_Deposits", "2023_Loans"
-- **Rotated tables**: Read following the text orientation
-- **Split tables**: If table continues across sections, treat as separate tables
-- **Nested data**: Extract hierarchical info maintaining structure
-
-## Output Format - CRITICAL
-Return ONLY a valid JSON object with this exact structure:
+## Output Format
 ```json
 {
     "table_data": [
         ["Header1", "Header2", "Header3"],
-        ["Row1Col1", "Row1Col2", "Row1Col3"],
-        ["Row2Col1", "Row2Col2", "Row2Col3"]
+        ["Row1Col1", "Row1Col2", "Row1Col3"]
     ],
-    "total_rows_extracted": 3,
+    "total_rows_extracted": 2,
     "confidence_score": 0.95,
-    "extraction_notes": "Extracted table with headers and data rows",
+    "extraction_notes": "Complete extraction",
     "tables_found": 1
 }
 ```
-
-If no tables are found, return:
-```json
-{
-    "table_data": [],
-    "total_rows_extracted": 0,
-    "confidence_score": 0.0,
-    "extraction_notes": "No tables detected on this page",
-    "tables_found": 0
-}
-```
-
-## Validation Checklist
-Before returning results, verify:
-- [ ] Every visible table identified
-- [ ] Row counts match exactly
-- [ ] All numbers preserved with original formatting
-- [ ] No data invented or modified
-- [ ] Headers are appropriate
-- [ ] All text readable and preserved
-
-CRITICAL: Look carefully at the image/text provided. Even simple data arranged in rows and columns counts as a table. Financial statements, lists with consistent formatting, charts with data - these are all tables.
 
 Begin extraction now.
 """
@@ -165,16 +147,63 @@ Begin extraction now.
 
     try:
         model = genai.GenerativeModel(model_name)
+        
+        # Enhanced generation config based on mode
+        if large_table_mode:
+            generation_config = {
+                "response_mime_type": "application/json",
+                "max_output_tokens": 8192,
+                "temperature": 0.0  # Most deterministic for large tables
+            }
+        else:
+            generation_config = {
+                "response_mime_type": "application/json",
+                "max_output_tokens": 4096,
+                "temperature": 0.1
+            }
+        
         response = model.generate_content(
             model_input,
-            generation_config={"response_mime_type": "application/json"}
+            generation_config=generation_config
         )
         
-        # Debug: Print raw response
-        st.write("Debug - Raw Response:", response.text[:500] + "..." if len(response.text) > 500 else response.text)
+        # Check if response was truncated
+        response_text = response.text.strip()
+        is_truncated = False
+        
+        if not response_text.endswith('}'):
+            st.warning("⚠️ Response appears to be truncated. Attempting to repair JSON...")
+            is_truncated = True
+            
+            # Attempt to repair truncated JSON
+            try:
+                # Find the last complete row
+                last_bracket = response_text.rfind(']')
+                if last_bracket > 0:
+                    # Try to close the JSON properly
+                    base_json = response_text[:last_bracket + 1]
+                    
+                    # Count rows to add metadata
+                    row_count = base_json.count('[') - 1  # Subtract 1 for the main array
+                    
+                    if large_table_mode:
+                        response_text = base_json + f',"rows":{row_count}}}'
+                    else:
+                        response_text = base_json + f',"total_rows_extracted":{row_count},"confidence_score":0.8,"extraction_notes":"Partially extracted due to size limits","tables_found":1}}'
+                        
+                    st.info(f"✅ Repaired JSON - extracted {row_count} rows")
+            except:
+                st.error("Could not repair truncated JSON")
+                return {"error": "Response was truncated and could not be repaired"}
+        
+        # Debug info
+        if large_table_mode:
+            st.write(f"Debug - Response length: {len(response_text)} chars")
+            st.write("Debug - Response start:", response_text[:300])
+            st.write("Debug - Response end:", response_text[-200:])
         
         # Parse JSON response
-        table_data = json.loads(response.text)
+        table_data = json.loads(response_text)
         
         # Validate the response structure
         if not isinstance(table_data, dict):
@@ -184,11 +213,24 @@ Begin extraction now.
         if "table_data" not in table_data:
             return {"error": "Missing 'table_data' in model response"}
         
+        # Add metadata if missing (for compact format)
+        if "total_rows_extracted" not in table_data:
+            table_data["total_rows_extracted"] = len(table_data["table_data"])
+        if "confidence_score" not in table_data:
+            table_data["confidence_score"] = 0.8 if is_truncated else 0.9
+        if "extraction_notes" not in table_data:
+            if is_truncated:
+                table_data["extraction_notes"] = f"Extracted {len(table_data['table_data'])} rows (truncated response repaired)"
+            else:
+                table_data["extraction_notes"] = f"Extracted {len(table_data['table_data'])} rows"
+        if "tables_found" not in table_data:
+            table_data["tables_found"] = 1
+        
         return table_data
         
     except json.JSONDecodeError as e:
         st.error(f"JSON parsing error: {e}")
-        st.write("Raw response that failed to parse:", response.text if 'response' in locals() else "No response received")
+        st.write("Raw response that failed to parse:", response_text[:1000] if 'response_text' in locals() else response.text[:1000])
         return {"error": f"Failed to parse model response as JSON: {e}"}
     except Exception as e:
         st.error(f"Model error: {e}")
@@ -216,8 +258,15 @@ with st.sidebar:
     # --- Model Selector ---
     model_choice = st.selectbox(
         "Choose AI Model",
-        ("gemini-2.0-flash-exp", "gemini-1.5-pro-latest", "gemini-1.5-flash-latest"),
-        help="Flash is faster and cheaper, while Pro is more powerful for complex tables."
+        ("gemini-1.5-pro-latest", "gemini-2.0-flash-exp", "gemini-1.5-flash-latest"),
+        help="Pro has higher token limits for large tables. Flash is faster but may truncate large tables."
+    )
+    
+    # --- Large Table Handling ---
+    handle_large_tables = st.checkbox(
+        "Large Table Mode", 
+        value=True,
+        help="Use optimized settings for tables with 50+ rows"
     )
     
     uploaded_file = st.file_uploader("Upload PDF", type="pdf")
@@ -247,7 +296,14 @@ if uploaded_file is not None:
                 st.session_state.result = None
             elif extracted_data['text'] or extracted_data['image']:
                 # 2. Use Gemini to extract and structure the table
-                structured_table = extract_table_with_gemini(extracted_data, model_name=model_choice)
+                if handle_large_tables:
+                    st.info("🔄 Large table mode enabled - using optimized extraction...")
+                
+                structured_table = extract_table_with_gemini(
+                    extracted_data, 
+                    model_name=model_choice,
+                    large_table_mode=handle_large_tables
+                )
                 st.session_state.result = structured_table
             else:
                 st.warning("Could not extract any meaningful data from the PDF page.")
