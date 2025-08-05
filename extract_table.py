@@ -95,19 +95,20 @@ You are a specialized document parser. Extract ALL tables from this page with co
 - Keep numbers exact but remove thousand separators if space-critical
 - Use "-" for empty cells consistently
 
-### Output Format - COMPACT
-```json
+### Output Format - CRITICAL
+Return ONLY a JSON object (NOT an array) with this exact structure:
 {
     "table_data": [
         ["No", "Bank", "Total", "Agriculture", "Mining", "Manufacturing", "Utilities", "Construction", "Wholesale", "Retail", "Accommodation", "Arts", "Transport", "Information", "RealEstate1", "RealEstate2", "Education", "Health", "Households", "Other"],
-        ["1", "ACLEDA Bank", "27934459", "5722614", "201477", "740254", "94281", "1446649", "1785014", "7502966", "1699046", "55445", "1269974", "11621", "171547", "1065967", "60991", "293008", "4145764", "1667641"],
-        ["2", "ARD Bank", "34261391", "1940701", "132366", "2232257", "451656", "1215570", "5457157", "9833936", "1377304", "121509", "936859", "39712", "570429", "6648074", "-", "-", "162242", "3111614"]
+        ["1", "ACLEDA Bank", "27934459", "5722614", "201477", "740254", "94281", "1446649", "1785014", "7502966", "1699046", "55445", "1269974", "11621", "171547", "1065967", "60991", "293008", "4145764", "1667641"]
     ],
     "rows": 52
 }
-```
 
-Extract ALL rows. Priority: COMPLETENESS over formatting details.
+CRITICAL: 
+- Return ONLY the JSON object, no arrays around it
+- Extract ALL visible rows
+- Priority: COMPLETENESS over formatting details
 """
     else:
         prompt_template = """
@@ -118,8 +119,8 @@ You are a specialized document parser. Extract ALL tables from this page with co
 - **PRESERVE EXACTLY**: All numbers, formatting, punctuation, and text as shown
 - **NO INTERPRETATION**: Extract exactly what you see, don't convert or standardize
 
-## Output Format
-```json
+## Output Format - CRITICAL
+Return ONLY a JSON object (NOT an array) with this exact structure:
 {
     "table_data": [
         ["Header1", "Header2", "Header3"],
@@ -130,8 +131,8 @@ You are a specialized document parser. Extract ALL tables from this page with co
     "extraction_notes": "Complete extraction",
     "tables_found": 1
 }
-```
 
+CRITICAL: Return ONLY the JSON object, no arrays around it.
 Begin extraction now.
 """
 
@@ -171,30 +172,63 @@ Begin extraction now.
         response_text = response.text.strip()
         is_truncated = False
         
-        if not response_text.endswith('}'):
+        # Fix malformed JSON from repair attempts
+        if response_text.count('}') > response_text.count('{'):
+            st.warning("⚠️ Detected malformed JSON, cleaning up...")
+            # Remove extra closing brackets
+            while response_text.endswith('}}') and response_text.count('}') > response_text.count('{'):
+                response_text = response_text[:-1]
+        
+        if not response_text.endswith('}') or response_text.count('{') != response_text.count('}'):
             st.warning("⚠️ Response appears to be truncated. Attempting to repair JSON...")
             is_truncated = True
             
             # Attempt to repair truncated JSON
             try:
-                # Find the last complete row
-                last_bracket = response_text.rfind(']')
-                if last_bracket > 0:
-                    # Try to close the JSON properly
-                    base_json = response_text[:last_bracket + 1]
+                # Remove any partial repair attempts first
+                if ',"rows":' in response_text:
+                    response_text = response_text.split(',"rows":')[0]
+                
+                # Find the last complete row by looking for the last complete array
+                lines = response_text.split('\n')
+                last_complete_row = -1
+                
+                for i in range(len(lines) - 1, -1, -1):
+                    line = lines[i].strip()
+                    if line.endswith('],') or line.endswith(']'):
+                        # Found a complete row
+                        last_complete_row = i
+                        break
+                
+                if last_complete_row > 0:
+                    # Reconstruct JSON up to last complete row
+                    reconstructed_lines = lines[:last_complete_row + 1]
                     
-                    # Count rows to add metadata
-                    row_count = base_json.count('[') - 1  # Subtract 1 for the main array
+                    # Fix the last line - remove trailing comma if present
+                    if reconstructed_lines[-1].strip().endswith('],'):
+                        reconstructed_lines[-1] = reconstructed_lines[-1].replace('],', ']')
                     
+                    base_json = '\n'.join(reconstructed_lines)
+                    
+                    # Count actual data rows (excluding header)
+                    row_count = base_json.count('[') - 2  # Subtract 2: one for main array, one for header
+                    if row_count < 0:
+                        row_count = 0
+                    
+                    # Close the JSON properly
                     if large_table_mode:
-                        response_text = base_json + f',"rows":{row_count}}}'
+                        response_text = base_json + f'\n],"rows":{row_count + 1}}}'  # +1 to include header
                     else:
-                        response_text = base_json + f',"total_rows_extracted":{row_count},"confidence_score":0.8,"extraction_notes":"Partially extracted due to size limits","tables_found":1}}'
+                        response_text = base_json + f'\n],"total_rows_extracted":{row_count + 1},"confidence_score":0.8,"extraction_notes":"Partially extracted due to size limits","tables_found":1}}'
                         
-                    st.info(f"✅ Repaired JSON - extracted {row_count} rows")
-            except:
-                st.error("Could not repair truncated JSON")
-                return {"error": "Response was truncated and could not be repaired"}
+                    st.info(f"✅ Repaired JSON - extracted {row_count + 1} rows (including header)")
+                else:
+                    st.error("Could not find any complete rows to repair JSON")
+                    return {"error": "Response was truncated and could not be repaired"}
+                    
+            except Exception as repair_error:
+                st.error(f"Could not repair truncated JSON: {repair_error}")
+                return {"error": f"Response was truncated and could not be repaired: {repair_error}"}
         
         # Debug info
         if large_table_mode:
@@ -203,7 +237,36 @@ Begin extraction now.
             st.write("Debug - Response end:", response_text[-200:])
         
         # Parse JSON response
-        table_data = json.loads(response_text)
+        try:
+            table_data = json.loads(response_text)
+            
+            # Handle case where model returns array instead of object
+            if isinstance(table_data, list) and len(table_data) > 0:
+                if isinstance(table_data[0], dict) and "table_data" in table_data[0]:
+                    table_data = table_data[0]  # Extract the first object from array
+                    st.info("Fixed: Model returned array instead of object")
+                
+        except json.JSONDecodeError as e:
+            # If JSON parsing fails, try to extract just the object part
+            st.warning("JSON parsing failed, attempting to extract object...")
+            
+            # Look for the first { and last } to extract the object
+            first_brace = response_text.find('{')
+            last_brace = response_text.rfind('}')
+            
+            if first_brace >= 0 and last_brace >= 0 and last_brace > first_brace:
+                try:
+                    object_json = response_text[first_brace:last_brace + 1]
+                    table_data = json.loads(object_json)
+                    st.info("Successfully extracted object from malformed JSON")
+                except:
+                    st.error(f"JSON parsing error: {e}")
+                    st.write("Raw response that failed to parse:", response_text[:1000])
+                    return {"error": f"Failed to parse model response as JSON: {e}"}
+            else:
+                st.error(f"JSON parsing error: {e}")
+                st.write("Raw response that failed to parse:", response_text[:1000])
+                return {"error": f"Failed to parse model response as JSON: {e}"}
         
         # Validate the response structure
         if not isinstance(table_data, dict):
