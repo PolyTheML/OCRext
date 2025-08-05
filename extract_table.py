@@ -78,9 +78,8 @@ def extract_table_with_gemini(data, model_name="gemini-1.5-flash-latest"):
     """
     Uses a selected Gemini model to extract a table from text or an image.
     """
-    prompt_template = """Creates the ultimate prompt for financial table extraction based on your requirements."""
-    return """
-You are a specialized financial document parser. Extract ALL tables from this page with complete accuracy.
+    prompt_template = """
+You are a specialized document parser. Extract ALL tables from this page with complete accuracy.
 
 ## Core Requirements
 - **EXTRACT EVERYTHING**: Every table, every row, every column, every cell
@@ -107,13 +106,7 @@ You are a specialized financial document parser. Extract ALL tables from this pa
 - **Duplicates**: Append "_2", "_3" etc: "Amount", "Amount_2", "Amount_3"
 - **Missing**: Generate "Column_1", "Column_2" if no clear headers
 
-### 4. Multi-language Support
-- **Mixed content**: Extract exactly as shown (don't translate)
-- **Bank names**: Keep full original text including English/Khmer
-- **Special characters**: Preserve all Unicode characters
-- **Numbers in text**: Keep as part of the string
-
-### 5. Complex Structure Handling
+### 4. Complex Structure Handling
 - **Multi-level headers**: Combine with underscore: "2024_Deposits", "2023_Loans"
 - **Rotated tables**: Read following the text orientation
 - **Split tables**: If table continues across sections, treat as separate tables
@@ -128,9 +121,21 @@ Return ONLY a valid JSON object with this exact structure:
         ["Row1Col1", "Row1Col2", "Row1Col3"],
         ["Row2Col1", "Row2Col2", "Row2Col3"]
     ],
-    "total_rows_extracted": 52,
+    "total_rows_extracted": 3,
     "confidence_score": 0.95,
-    "extraction_notes": "Extracted complete banking table with all financial metrics"
+    "extraction_notes": "Extracted table with headers and data rows",
+    "tables_found": 1
+}
+```
+
+If no tables are found, return:
+```json
+{
+    "table_data": [],
+    "total_rows_extracted": 0,
+    "confidence_score": 0.0,
+    "extraction_notes": "No tables detected on this page",
+    "tables_found": 0
 }
 ```
 
@@ -143,24 +148,18 @@ Before returning results, verify:
 - [ ] Headers are appropriate
 - [ ] All text readable and preserved
 
-## Example Transformation
-**Source row**: `Advanced Bank of Asia Limited | 43,051,336 | 34,281,391 | 79.6%`
-**JSON output**: 
-```json
-["Advanced Bank of Asia Limited", "43,051,336", "34,281,391", "79.6%"]
-```
-
-**CRITICAL INSTRUCTIONS**:
-1. Return ONLY the JSON object - no markdown, no explanations, no code blocks
-2. Extract EVERY visible row in the table
-3. Maintain exact numerical formatting
-4. Financial accuracy is critical - double-check all numerical values
-5. If you see 50+ rows, extract all 50+ rows
+CRITICAL: Look carefully at the image/text provided. Even simple data arranged in rows and columns counts as a table. Financial statements, lists with consistent formatting, charts with data - these are all tables.
 
 Begin extraction now.
 """
-    model_input = [prompt_template, data['text']]
 
+    model_input = [prompt_template]
+    
+    # Add text if available
+    if data.get('text') and data['text'].strip():
+        model_input.append(f"Text content from page:\n{data['text']}")
+    
+    # Add image if available
     if data.get("image"):
         model_input.append(data['image'])
 
@@ -170,9 +169,29 @@ Begin extraction now.
             model_input,
             generation_config={"response_mime_type": "application/json"}
         )
+        
+        # Debug: Print raw response
+        st.write("Debug - Raw Response:", response.text[:500] + "..." if len(response.text) > 500 else response.text)
+        
+        # Parse JSON response
         table_data = json.loads(response.text)
+        
+        # Validate the response structure
+        if not isinstance(table_data, dict):
+            return {"error": "Invalid response format from model"}
+        
+        # Check if we have the expected structure
+        if "table_data" not in table_data:
+            return {"error": "Missing 'table_data' in model response"}
+        
         return table_data
+        
+    except json.JSONDecodeError as e:
+        st.error(f"JSON parsing error: {e}")
+        st.write("Raw response that failed to parse:", response.text if 'response' in locals() else "No response received")
+        return {"error": f"Failed to parse model response as JSON: {e}"}
     except Exception as e:
+        st.error(f"Model error: {e}")
         return {"error": f"An error occurred while processing with the model: {e}"}
 
 
@@ -194,10 +213,10 @@ with st.sidebar:
     
     st.header("Settings")
     
-    # --- NEW: Model Selector ---
+    # --- Model Selector ---
     model_choice = st.selectbox(
         "Choose AI Model",
-        ("gemini-2.5-pro", "gemini-2.0-flash-exp"),
+        ("gemini-2.0-flash-exp", "gemini-1.5-pro-latest", "gemini-1.5-flash-latest"),
         help="Flash is faster and cheaper, while Pro is more powerful for complex tables."
     )
     
@@ -227,9 +246,9 @@ if uploaded_file is not None:
                 st.error(extracted_data["error"])
                 st.session_state.result = None
             elif extracted_data['text'] or extracted_data['image']:
-                # 2. Use Gemini to extract and structure the table, passing the selected model
+                # 2. Use Gemini to extract and structure the table
                 structured_table = extract_table_with_gemini(extracted_data, model_name=model_choice)
-                st.session_state.result = structured_table # Store result in session state
+                st.session_state.result = structured_table
             else:
                 st.warning("Could not extract any meaningful data from the PDF page.")
                 st.session_state.result = None
@@ -237,42 +256,67 @@ if uploaded_file is not None:
     # --- Display Results ---
     if st.session_state.result:
         result = st.session_state.result
-        st.success("Table extracted successfully!")
         
+        # Check for errors first
         if isinstance(result, dict) and "error" in result:
             st.error(f"An error occurred: {result['error']}")
-        elif isinstance(result, list) and len(result) > 0:
-            st.subheader("Extracted Data (as Table)")
-            df = pd.DataFrame(result)
-            st.dataframe(df)
-
-            # --- Download Buttons ---
-            col1, col2 = st.columns(2)
+        elif isinstance(result, dict) and "table_data" in result:
+            # Handle the new JSON structure
+            table_data = result["table_data"]
             
-            # Convert DataFrame to CSV
-            csv = df.to_csv(index=False).encode('utf-8')
-            col1.download_button(
-                label="📥 Download as CSV",
-                data=csv,
-                file_name=f"{os.path.splitext(uploaded_file.name)[0]}_page_{page_number}.csv",
-                mime="text/csv",
-            )
+            if not table_data or len(table_data) == 0:
+                st.warning("No tables found on the specified page.")
+                st.info("Extraction details:")
+                st.json(result)
+            else:
+                st.success("Table extracted successfully!")
+                
+                # Display extraction metadata
+                col1, col2, col3 = st.columns(3)
+                with col1:
+                    st.metric("Tables Found", result.get("tables_found", 1))
+                with col2:
+                    st.metric("Rows Extracted", result.get("total_rows_extracted", len(table_data)))
+                with col3:
+                    st.metric("Confidence", f"{result.get('confidence_score', 0):.1%}")
+                
+                if result.get("extraction_notes"):
+                    st.info(f"Notes: {result['extraction_notes']}")
+                
+                # Display the table
+                st.subheader("Extracted Data")
+                df = pd.DataFrame(table_data)
+                st.dataframe(df, use_container_width=True)
 
-            # Convert DataFrame to Excel
-            output = io.BytesIO()
-            with pd.ExcelWriter(output, engine='openpyxl') as writer:
-                df.to_excel(writer, index=False, sheet_name='Sheet1')
-            excel_data = output.getvalue()
-            col2.download_button(
-                label="📥 Download as Excel",
-                data=excel_data,
-                file_name=f"{os.path.splitext(uploaded_file.name)[0]}_page_{page_number}.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            )
-            
-            st.subheader("Raw JSON Output")
-            st.json(result)
+                # --- Download Buttons ---
+                col1, col2 = st.columns(2)
+                
+                # Convert DataFrame to CSV
+                csv = df.to_csv(index=False).encode('utf-8')
+                col1.download_button(
+                    label="📥 Download as CSV",
+                    data=csv,
+                    file_name=f"{os.path.splitext(uploaded_file.name)[0]}_page_{page_number}.csv",
+                    mime="text/csv",
+                )
+
+                # Convert DataFrame to Excel
+                output = io.BytesIO()
+                with pd.ExcelWriter(output, engine='openpyxl') as writer:
+                    df.to_excel(writer, index=False, sheet_name='Sheet1')
+                excel_data = output.getvalue()
+                col2.download_button(
+                    label="📥 Download as Excel",
+                    data=excel_data,
+                    file_name=f"{os.path.splitext(uploaded_file.name)[0]}_page_{page_number}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                )
+                
+                # Show raw JSON for debugging
+                with st.expander("Show Raw JSON Response"):
+                    st.json(result)
         else:
-            st.warning("The model did not find a table on the specified page or the result was empty.")
+            st.warning("Unexpected response format from the model.")
+            st.json(result)
 else:
     st.info("Please upload a PDF file to get started.")
